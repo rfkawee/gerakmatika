@@ -1,16 +1,17 @@
-import streamlit as st
+import cvzone
 import cv2
-import numpy as np
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
-import av
 from cvzone.HandTrackingModule import HandDetector
+import numpy as np
 import google.generativeai as genai
 from PIL import Image
-import threading
+import streamlit as st
 
-# Custom CSS
+# Custom CSS for background and style
 st.markdown("""
     <style>
+    body, .main {
+        background: #f8fafc;
+    }
     .stApp {
         background: linear-gradient(135deg, #f7faff 60%, #b3c6ff 100%);
     }
@@ -33,6 +34,15 @@ st.markdown("""
         font-size: 1.2em;
         margin-top: 8px;
     }
+    .stButton>button {
+        color: white;
+        background: linear-gradient(90deg, #6a11cb 0%, #2575fc 100%);
+        border-radius: 8px;
+        font-weight: bold;
+    }
+    .stCheckbox>div {
+        color: #2575fc;
+    }
     .answer-box {
         background: #fff;
         border-left: 8px solid #2575fc;
@@ -49,7 +59,7 @@ st.markdown("""
 
 st.set_page_config(layout="wide", page_title="AI Math Gesture", page_icon="🖐️")
 
-# Header
+# Main title and description (tanpa sidebar)
 st.markdown("""
 <div class="header-box">
     <div class="header-title">AI Math Gesture Recognition</div>
@@ -60,154 +70,75 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Konfigurasi Gemini API
-try:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel('gemini-1.5-flash')
-except:
-    st.error("API Key Gemini tidak ditemukan. Tambahkan ke secrets.toml")
-    st.stop()
+col1, col2 = st.columns([3,2], gap="large")
+with col1:
+    run = st.checkbox('Aktifkan Kamera', value=True, help="Aktifkan kamera untuk mulai menggambar soal matematika.")
+    FRAME_WINDOW = st.image([])
+with col2:
+    st.markdown("### Jawaban AI")
+    output_placeholder = st.empty()
 
-# RTC Configuration untuk deployment
-RTC_CONFIGURATION = RTCConfiguration({
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-    ]
-})
+genai.configure(api_key="AIzaSyCTRpz_zZWDiu6I1AZqKMRJDGVYYmnOefs")
+model = genai.GenerativeModel('gemini-1.5-flash')
 
-class MathGestureTransformer(VideoTransformerBase):
-    def __init__(self):
-        self.detector = HandDetector(
-            staticMode=False, 
-            maxHands=1, 
-            modelComplexity=1, 
-            detectionCon=0.7, 
-            minTrackCon=0.5
-        )
-        self.canvas = None
-        self.prev_pos = None
-        self.lock = threading.Lock()
-        
-    def getHandInfo(self, img):
-        hands, img = self.detector.findHands(img, draw=False, flipType=True)
-        if hands:
-            hand = hands[0]
-            lmList = hand["lmList"]
-            fingers = self.detector.fingersUp(hand)
-            return fingers, lmList
+cap = cv2.VideoCapture(0)
+cap.set(3,1280)
+cap.set(4,720)
+
+detector = HandDetector(staticMode=False, maxHands=1, modelComplexity=1, detectionCon=0.7, minTrackCon=0.5)
+
+def getHandInfo(img):
+    hands, img = detector.findHands(img, draw=False, flipType=True)
+    if hands:
+        hand = hands[0]
+        lmList = hand["lmList"]
+        fingers = detector.fingersUp(hand)
+        print(fingers)
+        return fingers, lmList
+    else:
         return None
 
-    def draw(self, info, img):
-        if self.canvas is None:
-            self.canvas = np.zeros_like(img)
-            
+def draw(info,prev_pos,canvas):
+    fingers, lmList = info
+    current_pos= None
+    if fingers == [0, 1, 0, 0, 0]:
+        current_pos = lmList[8][0:2]
+        if prev_pos is None: prev_pos = current_pos
+        cv2.line(canvas,current_pos,prev_pos,(255,0,255),10)
+    elif fingers == [1, 0, 0, 0, 0]:
+        canvas = np.zeros_like(img)
+    return current_pos, canvas
+
+def sendToAI(model,canvas,fingers):
+    if fingers == [1,1,0,0,1]:
+        pil_image = Image.fromarray(canvas)
+        # response = model.generate_content(["Solve this math problem", pil_image])
+        response = model.generate_content(["Selesaikan soal matematika ini", pil_image])
+        return response.text
+
+prev_pos= None
+canvas=None
+image_combined = None
+output_text= ""
+while True:
+    success, img = cap.read()
+    img = cv2.flip(img, 1)
+
+    if canvas is None:
+        canvas = np.zeros_like(img)
+
+    info = getHandInfo(img)
+    if info:
         fingers, lmList = info
-        current_pos = None
-        
-        # Jari telunjuk untuk menggambar
-        if fingers == [0, 1, 0, 0, 0]:
-            current_pos = lmList[8][0:2]
-            if self.prev_pos is None:
-                self.prev_pos = current_pos
-            cv2.line(self.canvas, tuple(current_pos), tuple(self.prev_pos), (255, 0, 255), 10)
-            self.prev_pos = current_pos
-        
-        # Jempol untuk menghapus
-        elif fingers == [1, 0, 0, 0, 0]:
-            self.canvas = np.zeros_like(img)
-            self.prev_pos = None
-        
-        # Gesture untuk mengirim ke AI (thumb + index + pinky)
-        elif fingers == [1, 1, 0, 0, 1]:
-            self.sendToAI()
-        
-        else:
-            self.prev_pos = None
-        
-        return current_pos
+        prev_pos,canvas = draw(info, prev_pos,canvas)
+        output_text = sendToAI(model,canvas,fingers)
 
-    def sendToAI(self):
-        if self.canvas is not None:
-            try:
-                # Convert canvas to PIL Image
-                pil_image = Image.fromarray(self.canvas)
-                response = model.generate_content(["Selesaikan soal matematika ini", pil_image])
-                
-                # Store result in session state
-                st.session_state.ai_result = response.text
-            except Exception as e:
-                st.session_state.ai_result = f"Error: {str(e)}"
+    image_combined= cv2.addWeighted(img,0.7,canvas,0.3,0)
+    FRAME_WINDOW.image(image_combined,channels="BGR")
 
-    def transform(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        
-        with self.lock:
-            info = self.getHandInfo(img)
-            if info:
-                self.draw(info, img)
-            
-            # Overlay canvas on image
-            if self.canvas is not None:
-                img = cv2.addWeighted(img, 0.7, self.canvas, 0.3, 0)
-        
-        return img
-
-# Layout
-col1, col2 = st.columns([3, 2], gap="large")
-
-with col1:
-    st.markdown("### 📹 Kamera")
-    st.markdown("""
-    **Instruksi:**
-    - ✋ **Jari telunjuk** = Menggambar
-    - 👍 **Jempol** = Menghapus canvas
-    - 🤟 **Jempol + Telunjuk + Kelingking** = Kirim ke AI
-    """)
-    
-    # WebRTC Streamer
-    webrtc_ctx = webrtc_streamer(
-        key="math-gesture",
-        mode="send-channel",
-        rtc_configuration=RTC_CONFIGURATION,
-        video_transformer_factory=MathGestureTransformer,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
-
-with col2:
-    st.markdown("### 🤖 Jawaban AI")
-    
-    # Display AI result
-    if hasattr(st.session_state, 'ai_result') and st.session_state.ai_result:
-        st.markdown(
-            f"<div class='answer-box'>{st.session_state.ai_result}</div>", 
-            unsafe_allow_html=True
+    if output_text:
+        output_placeholder.markdown(
+            f"<div class='answer-box'>{output_text}</div>", unsafe_allow_html=True
         )
-    else:
-        st.info("Gambar soal matematika dengan gesture tangan, lalu gunakan gesture kirim untuk mendapatkan jawaban.")
 
-# Instructions
-st.markdown("""
----
-### 📋 Cara Menggunakan:
-
-1. **Izinkan akses kamera** ketika browser meminta
-2. **Gambar soal matematika** dengan menggunakan jari telunjuk
-3. **Hapus gambar** dengan menunjukkan jempol
-4. **Kirim ke AI** dengan gesture jempol + telunjuk + kelingking
-5. **Lihat hasil** di panel sebelah kanan
-
-### ⚠️ Catatan Penting:
-- Aplikasi ini memerlukan **HTTPS** untuk akses kamera
-- Pastikan **pencahayaan cukup** untuk deteksi tangan yang optimal
-- **Gesture harus jelas** dan stabil
-""")
-
-# Footer
-st.markdown("""
----
-<div style="text-align: center; color: #666; margin-top: 20px;">
-    Powered by Streamlit WebRTC + Gemini AI + CVZone
-</div>
-""", unsafe_allow_html=True)
+    cv2.waitKey(1)
